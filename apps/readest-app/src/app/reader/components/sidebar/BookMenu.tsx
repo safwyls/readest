@@ -14,8 +14,11 @@ import { isWebAppPlatform } from '@/services/environment';
 import { eventDispatcher } from '@/utils/event';
 import { DOWNLOAD_READEST_URL } from '@/services/constants';
 import { setKOSyncSettingsWindowVisible } from '@/app/reader/components/KOSyncSettings';
+import { setHardcoverSettingsWindowVisible } from '@/app/reader/components/HardcoverSettings';
 import { setProofreadRulesVisibility } from '@/app/reader/components/ProofreadRules';
 import { FIXED_LAYOUT_FORMATS } from '@/types/book';
+import { useBookDataStore } from '@/store/bookDataStore';
+import { HardcoverClient } from '@/services/sync/HardcoverClient';
 import useBooksManager from '../../hooks/useBooksManager';
 import MenuItem from '@/components/MenuItem';
 import Menu from '@/components/Menu';
@@ -91,6 +94,67 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
     eventDispatcher.dispatch('push-kosync', { bookKey: sideBarBookKey });
     setIsDropdownOpen?.(false);
   };
+  const showHardcoverSettingsWindow = () => {
+    setHardcoverSettingsWindowVisible(true);
+    setIsDropdownOpen?.(false);
+  };
+  const handlePullHardcover = () => {
+    eventDispatcher.dispatch('pull-hardcover', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handlePushHardcover = () => {
+    eventDispatcher.dispatch('push-hardcover', { bookKey: sideBarBookKey });
+    setIsDropdownOpen?.(false);
+  };
+  const handleCleanupHardcoverReads = async () => {
+    setIsDropdownOpen?.(false);
+
+    const { getConfig } = useBookDataStore.getState();
+    const config = getConfig(sideBarBookKey!);
+    const hardcoverId = config?.hardcoverId;
+
+    if (!hardcoverId) {
+      eventDispatcher.dispatch('toast', {
+        message: _('No Hardcover book linked. Please match the book first.'),
+        type: 'warning',
+      });
+      return;
+    }
+
+    try {
+      const client = new HardcoverClient(settings.hardcover);
+      const reads = await client.getAllReads(hardcoverId);
+
+      if (reads.length <= 1) {
+        eventDispatcher.dispatch('toast', {
+          message: _('No duplicate reads to clean up'),
+          type: 'info',
+        });
+        return;
+      }
+
+      const confirmed = confirm(
+        _('Found {{count}} reads. Keep only the one with highest progress and delete the rest?', {
+          count: reads.length,
+        })
+      );
+
+      if (!confirmed) return;
+
+      const result = await client.cleanupDuplicateReads(hardcoverId);
+
+      eventDispatcher.dispatch('toast', {
+        message: _('Deleted {{count}} duplicate reads', { count: result.deleted }),
+        type: 'success',
+      });
+    } catch (error) {
+      console.error('Failed to cleanup reads:', error);
+      eventDispatcher.dispatch('toast', {
+        message: _('Failed to cleanup duplicate reads'),
+        type: 'error',
+      });
+    }
+  };
 
   return (
     <Menu
@@ -149,6 +213,15 @@ const BookMenu: React.FC<BookMenuProps> = ({ menuClassName, setIsDropdownOpen })
         <>
           <MenuItem label={_('Push Progress')} onClick={handlePushKOSync} />
           <MenuItem label={_('Pull Progress')} onClick={handlePullKOSync} />
+        </>
+      )}
+      <hr className='border-base-200 my-1' />
+      <MenuItem label={_('Hardcover Sync')} onClick={showHardcoverSettingsWindow} />
+      {settings.hardcover?.enabled && (
+        <>
+          <MenuItem label={_('Push to Hardcover')} onClick={handlePushHardcover} />
+          <MenuItem label={_('Pull from Hardcover')} onClick={handlePullHardcover} />
+          <MenuItem label={_('Clean Up Duplicate Reads')} onClick={handleCleanupHardcoverReads} />
         </>
       )}
       <hr className='border-base-200 my-1' />

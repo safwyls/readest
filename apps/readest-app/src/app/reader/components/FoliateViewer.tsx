@@ -20,6 +20,7 @@ import { useAutoFocus } from '@/hooks/useAutoFocus';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useEinkMode } from '@/hooks/useEinkMode';
 import { useKOSync } from '../hooks/useKOSync';
+import { useHardcoverSync } from '../hooks/useHardcoverSync';
 import {
   applyFixedlayoutStyles,
   applyImageStyle,
@@ -60,6 +61,8 @@ import { isCJKLang } from '@/utils/lang';
 import { getLocale } from '@/utils/misc';
 import Spinner from '@/components/Spinner';
 import KOSyncConflictResolver from './KOSyncResolver';
+import HardcoverConflictResolver from './HardcoverConflictResolver';
+import HardcoverBookMatcher from './HardcoverBookMatcher';
 
 declare global {
   interface Window {
@@ -82,7 +85,7 @@ const FoliateViewer: React.FC<{
   const { getView, setView: setFoliateView, setViewInited, setProgress } = useReaderStore();
   const { getViewState, getViewSettings, setViewSettings } = useReaderStore();
   const { getParallels } = useParallelViewStore();
-  const { getBookData } = useBookDataStore();
+  const { getBookData, setConfig } = useBookDataStore();
   const { applyBackgroundTexture } = useBackgroundTexture();
   const { applyEinkMode } = useEinkMode();
   const viewState = getViewState(bookKey);
@@ -108,6 +111,15 @@ const FoliateViewer: React.FC<{
   useProgressAutoSave(bookKey);
   useBookCoverAutoSave(bookKey);
   const { syncState, conflictDetails, resolveWithLocal, resolveWithRemote } = useKOSync(bookKey);
+  const {
+    syncState: hardcoverSyncState,
+    conflictDetails: hardcoverConflictDetails,
+    needsMatching,
+    hardcoverClient,
+    resolveWithLocal: hardcoverResolveLocal,
+    resolveWithRemote: hardcoverResolveRemote,
+    setNeedsMatching,
+  } = useHardcoverSync(bookKey);
   useTextTranslation(bookKey, viewRef.current);
 
   const progressRelocateHandler = (event: Event) => {
@@ -510,6 +522,26 @@ const FoliateViewer: React.FC<{
           onResolveWithLocal={resolveWithLocal}
           onResolveWithRemote={resolveWithRemote}
           onClose={resolveWithLocal}
+        />
+      )}
+      {hardcoverSyncState === 'conflict' && hardcoverConflictDetails && (
+        <HardcoverConflictResolver
+          details={hardcoverConflictDetails}
+          onResolveWithLocal={hardcoverResolveLocal}
+          onResolveWithRemote={hardcoverResolveRemote}
+          onClose={hardcoverResolveLocal}
+        />
+      )}
+      {needsMatching && hardcoverClient && getBookData(bookKey)?.book && (
+        <HardcoverBookMatcher
+          book={getBookData(bookKey)!.book!}
+          client={hardcoverClient}
+          isOpen={true}
+          onMatch={(hardcoverId) => {
+            setConfig(bookKey, { ...config!, hardcoverId });
+            setNeedsMatching(false);
+          }}
+          onClose={() => setNeedsMatching(false)}
         />
       )}
     </>

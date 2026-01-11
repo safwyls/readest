@@ -12,6 +12,8 @@ export type LibraryCoverFitType = 'crop' | 'fit';
 export type KOSyncChecksumMethod = 'binary' | 'filename';
 export type KOSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
 
+export type HardcoverSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
+
 export interface ReadSettings {
   sideBarWidth: string;
   isSideBarPinned: boolean;
@@ -37,6 +39,17 @@ export interface KOSyncSettings {
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
   strategy: KOSyncStrategy;
+}
+
+export interface HardcoverSettings {
+  enabled: boolean;
+  apiToken: string;
+  strategy: HardcoverSyncStrategy;
+  syncProgress: boolean;
+  syncStatus: boolean;
+  autoMatchBooks: boolean;
+  rateLimitBuffer: number;
+  debug: boolean;
 }
 
 export interface SystemSettings {
@@ -71,6 +84,7 @@ export interface SystemSettings {
   opdsCatalogs: OPDSCatalog[];
 
   kosync: KOSyncSettings;
+  hardcover: HardcoverSettings;
 
   lastSyncedAtBooks: number;
   lastSyncedAtConfigs: number;

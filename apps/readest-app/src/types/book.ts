@@ -305,6 +305,13 @@ export interface BookConfig {
   lastSyncedAtConfig?: number;
   lastSyncedAtNotes?: number;
 
+  hardcoverId?: string; // Hardcover user_book ID for matched books
+  hardcoverReadId?: number; // Hardcover user_book_read ID for progress tracking
+  hardcoverEditionId?: number; // Hardcover edition_id for the book
+  hardcoverStartedAt?: string; // Started date for the current read (YYYY-MM-DD)
+  hardcoverLastSynced?: number; // Last sync timestamp with Hardcover
+  hardcoverRemoteTotalPages?: number; // Remote book/edition total pages (for EPUB page mapping)
+
   updatedAt: number;
 }
 

@@ -24,6 +24,7 @@ import { getSysFontsList, setSystemUIVisibility } from '@/utils/bridge';
 import { AboutWindow } from '@/components/AboutWindow';
 import { UpdaterWindow } from '@/components/UpdaterWindow';
 import { KOSyncSettingsWindow } from './KOSyncSettings';
+import { HardcoverSettingsWindow } from './HardcoverSettings';
 import { ProofreadRulesManager } from './ProofreadRules';
 import { Toast } from '@/components/Toast';
 import { getLocale } from '@/utils/misc';
@@ -160,6 +161,7 @@ const Reader: React.FC<{ ids?: string }> = ({ ids }) => {
         <AboutWindow />
         <UpdaterWindow />
         <KOSyncSettingsWindow />
+        <HardcoverSettingsWindow />
         <ProofreadRulesManager />
         <Toast />
       </Suspense>
