@@ -25,10 +25,93 @@ const HARDCOVER_API_URL = 'https://api.hardcover.app/v1/graphql';
 const RATE_LIMIT_WINDOW = 60000; // 1 minute
 const MAX_REQUESTS_PER_WINDOW = 60;
 
+// Circuit breaker configuration
+const CIRCUIT_BREAKER_THRESHOLD = 3; // Open circuit after 3 consecutive failures
+const CIRCUIT_BREAKER_TIMEOUT = 60000; // Try again after 1 minute
+const CIRCUIT_BREAKER_HALF_OPEN_REQUESTS = 1; // Allow 1 request in half-open state
+
+enum CircuitState {
+  CLOSED = 'CLOSED', // Normal operation
+  OPEN = 'OPEN', // Failing, reject requests immediately
+  HALF_OPEN = 'HALF_OPEN', // Testing if service recovered
+}
+
+// Global circuit breaker state (shared across all client instances)
+class CircuitBreakerState {
+  private static instance: CircuitBreakerState;
+
+  state: CircuitState = CircuitState.CLOSED;
+  failureCount: number = 0;
+  lastFailureTime: number = 0;
+  halfOpenAttempts: number = 0;
+  hasNotifiedDisconnect: boolean = false; // Track if we've shown disconnect toast
+
+  private constructor() {}
+
+  static getInstance(): CircuitBreakerState {
+    if (!CircuitBreakerState.instance) {
+      CircuitBreakerState.instance = new CircuitBreakerState();
+    }
+    return CircuitBreakerState.instance;
+  }
+
+  reset() {
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.lastFailureTime = 0;
+    this.halfOpenAttempts = 0;
+    this.hasNotifiedDisconnect = false;
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      lastFailureTime: this.lastFailureTime,
+      hasNotifiedDisconnect: this.hasNotifiedDisconnect,
+    };
+  }
+
+  checkAndClearRecoveryFlag(): boolean {
+    if (this.lastFailureTime === -1) {
+      this.lastFailureTime = 0; // Clear the flag
+      this.hasNotifiedDisconnect = false; // Clear disconnect notification flag on recovery
+      return true; // Was just recovered
+    }
+    return false; // Not a recovery
+  }
+
+  markDisconnectNotified() {
+    this.hasNotifiedDisconnect = true;
+  }
+}
+
+// Export function to get circuit breaker state from anywhere
+export const getHardcoverCircuitState = () => {
+  return CircuitBreakerState.getInstance().getState();
+};
+
+// Export function to check and clear recovery flag
+export const checkAndClearHardcoverRecovery = () => {
+  return CircuitBreakerState.getInstance().checkAndClearRecoveryFlag();
+};
+
+// Export function to mark that we've notified user of disconnect
+export const markHardcoverDisconnectNotified = () => {
+  CircuitBreakerState.getInstance().markDisconnectNotified();
+};
+
+// Export function to manually reset circuit breaker
+export const resetHardcoverCircuitBreaker = () => {
+  console.log('[Circuit Breaker] Manual reset triggered');
+  CircuitBreakerState.getInstance().reset();
+};
+
 export class HardcoverClient {
   private config: HardcoverSettings;
   private requestTimestamps: number[] = [];
   private userId: number | null = null;
+  private circuitBreaker = CircuitBreakerState.getInstance();
 
   constructor(config: HardcoverSettings) {
     this.config = config;
@@ -40,6 +123,102 @@ export class HardcoverClient {
   private debugLog(...args: any[]) {
     if (this.config.debug) {
       console.log(...args);
+    }
+  }
+
+  /**
+   * Get current circuit breaker state (for user feedback)
+   */
+  getCircuitState() {
+    return {
+      state: this.circuitBreaker.state,
+      failureCount: this.circuitBreaker.failureCount,
+      lastFailureTime: this.circuitBreaker.lastFailureTime,
+    };
+  }
+
+  /**
+   * Check if circuit breaker allows the request
+   */
+  private canMakeRequest(): { allowed: boolean; reason?: string } {
+    const now = Date.now();
+
+    switch (this.circuitBreaker.state) {
+      case CircuitState.CLOSED:
+        // Normal operation
+        return { allowed: true };
+
+      case CircuitState.OPEN:
+        // Check if timeout has elapsed
+        if (now - this.circuitBreaker.lastFailureTime >= CIRCUIT_BREAKER_TIMEOUT) {
+          console.log('[Circuit Breaker] ⏰ Timeout elapsed, transitioning to HALF_OPEN');
+          this.circuitBreaker.state = CircuitState.HALF_OPEN;
+          this.circuitBreaker.halfOpenAttempts = 0;
+          return { allowed: true };
+        }
+        // Circuit still open
+        const waitTime = Math.ceil((CIRCUIT_BREAKER_TIMEOUT - (now - this.circuitBreaker.lastFailureTime)) / 1000);
+        return {
+          allowed: false,
+          reason: `Circuit breaker is open. Hardcover service unavailable. Retry in ${waitTime}s.`,
+        };
+
+      case CircuitState.HALF_OPEN:
+        // Allow limited requests to test service
+        if (this.circuitBreaker.halfOpenAttempts < CIRCUIT_BREAKER_HALF_OPEN_REQUESTS) {
+          this.circuitBreaker.halfOpenAttempts++;
+          return { allowed: true };
+        }
+        return {
+          allowed: false,
+          reason: 'Circuit breaker is testing service recovery. Please wait.',
+        };
+    }
+  }
+
+  /**
+   * Record a successful request
+   */
+  private recordSuccess() {
+    const wasHalfOpen = this.circuitBreaker.state === CircuitState.HALF_OPEN;
+    if (wasHalfOpen) {
+      console.log('[Circuit Breaker] ✅ Request succeeded in HALF_OPEN, transitioning to CLOSED');
+      this.circuitBreaker.state = CircuitState.CLOSED;
+      // Set a flag so the hook can show a recovery toast
+      this.circuitBreaker.lastFailureTime = -1; // Use -1 as a signal that we just recovered
+    }
+    this.circuitBreaker.failureCount = 0;
+  }
+
+  /**
+   * Record a failed request
+   */
+  private recordFailure(error: string) {
+    this.circuitBreaker.failureCount++;
+    this.circuitBreaker.lastFailureTime = Date.now();
+
+    // Don't open circuit for auth failures (user needs to fix token)
+    if (error.includes('AUTH_FAILED')) {
+      console.log('[Circuit Breaker] Auth failure, not counting towards circuit breaker');
+      return;
+    }
+
+    if (this.circuitBreaker.state === CircuitState.HALF_OPEN) {
+      console.warn('[Circuit Breaker] ❌ Request failed in HALF_OPEN, transitioning to OPEN');
+      this.circuitBreaker.state = CircuitState.OPEN;
+      this.circuitBreaker.failureCount = CIRCUIT_BREAKER_THRESHOLD; // Ensure we stay open
+      return;
+    }
+
+    if (this.circuitBreaker.failureCount >= CIRCUIT_BREAKER_THRESHOLD) {
+      console.warn(
+        `[Circuit Breaker] ⚠️ OPENED after ${this.circuitBreaker.failureCount} consecutive failures. Will retry in 60s.`,
+      );
+      this.circuitBreaker.state = CircuitState.OPEN;
+    } else {
+      console.log(
+        `[Circuit Breaker] Failure ${this.circuitBreaker.failureCount}/${CIRCUIT_BREAKER_THRESHOLD}`,
+      );
     }
   }
 
@@ -85,7 +264,15 @@ export class HardcoverClient {
   private async graphqlRequest<T>(
     query: string,
     variables: Record<string, unknown> = {},
+    options: { keepalive?: boolean } = {},
   ): Promise<T> {
+    // Check circuit breaker first
+    const { allowed, reason } = this.canMakeRequest();
+    if (!allowed) {
+      console.warn('[Circuit Breaker] 🚫 Request blocked:', reason);
+      throw new Error(`HARDCOVER_CIRCUIT_OPEN: ${reason}`);
+    }
+
     if (!this.config.apiToken || this.config.apiToken.trim() === '') {
       throw new Error('HARDCOVER_AUTH_FAILED');
     }
@@ -106,6 +293,7 @@ export class HardcoverClient {
         method: 'POST',
         headers,
         body,
+        keepalive: options.keepalive || false,
       });
 
       if (!response.ok) {
@@ -129,29 +317,51 @@ export class HardcoverClient {
 
         // Handle specific GraphQL error codes
         if (errorMsg.includes('403') || errorMsg.includes('Forbidden')) {
-          throw new Error('HARDCOVER_AUTH_FAILED');
+          const authError = new Error('HARDCOVER_AUTH_FAILED');
+          this.recordFailure(authError.message);
+          throw authError;
         }
         if (errorMsg.includes('401') || errorMsg.includes('Unauthorized')) {
-          throw new Error('HARDCOVER_AUTH_FAILED');
+          const authError = new Error('HARDCOVER_AUTH_FAILED');
+          this.recordFailure(authError.message);
+          throw authError;
         }
         if (errorMsg.includes('429') || errorMsg.includes('rate limit')) {
-          throw new Error('HARDCOVER_RATE_LIMIT');
+          const rateLimitError = new Error('HARDCOVER_RATE_LIMIT');
+          this.recordFailure(rateLimitError.message);
+          throw rateLimitError;
         }
 
-        throw new Error(`HARDCOVER_GRAPHQL_ERROR: ${errorMsg}`);
+        const graphqlError = new Error(`HARDCOVER_GRAPHQL_ERROR: ${errorMsg}`);
+        this.recordFailure(graphqlError.message);
+        throw graphqlError;
       }
 
+      // Success - record it
+      this.recordSuccess();
       return json.data as T;
     } catch (error) {
       if (error instanceof Error) {
+        // If error was already thrown above (with recordFailure called), re-throw it
+        if (error.message.startsWith('HARDCOVER_')) {
+          throw error;
+        }
+
         // Network errors
         if (error.message.includes('fetch') || error.message.includes('network')) {
-          throw new Error('HARDCOVER_NETWORK_ERROR');
+          const networkError = new Error('HARDCOVER_NETWORK_ERROR');
+          this.recordFailure(networkError.message);
+          throw networkError;
         }
+
+        // Other errors
+        this.recordFailure(error.message);
         throw error;
       }
       console.error('Hardcover GraphQL request failed:', error);
-      throw new Error('HARDCOVER_UNKNOWN_ERROR');
+      const unknownError = new Error('HARDCOVER_UNKNOWN_ERROR');
+      this.recordFailure(unknownError.message);
+      throw unknownError;
     }
   }
 
@@ -315,6 +525,7 @@ export class HardcoverClient {
     readId?: number,
     editionId?: number,
     startedAt?: string,
+    keepalive?: boolean,
   ): Promise<{ success: boolean; readId?: number; editionId?: number; startedAt?: string }> {
     try {
       this.debugLog('[Hardcover] Updating progress:', { userBookId, page, readId, editionId, startedAt });
@@ -350,6 +561,7 @@ export class HardcoverClient {
         }>(
           UPDATE_PROGRESS_MUTATION,
           variables,
+          { keepalive },
         );
         this.debugLog('[Hardcover] UPDATE result:', JSON.stringify(result, null, 2));
 
@@ -357,7 +569,7 @@ export class HardcoverClient {
           console.error('[Hardcover] Update error:', result.update_user_book_read.error);
           // If update failed, maybe the read was deleted - try creating a new one
           this.debugLog('[Hardcover] Falling back to creating new read...');
-          return this.updateProgress(userBookId, page, percentage, undefined, editionId, startedAt);
+          return this.updateProgress(userBookId, page, percentage, undefined, editionId, startedAt, keepalive);
         }
 
         const userBookRead = result.update_user_book_read?.user_book_read;
@@ -371,7 +583,7 @@ export class HardcoverClient {
         if (userBookRead.progress_pages === null) {
           console.warn('[Hardcover] Update returned null progress - read is finished, creating new read instead');
           // Recursively call with no readId to create a new read
-          return this.updateProgress(userBookId, page, percentage, undefined, editionId, startedAt);
+          return this.updateProgress(userBookId, page, percentage, undefined, editionId, startedAt, keepalive);
         }
 
         this.debugLog('[Hardcover] Successfully updated read:', {
@@ -416,6 +628,7 @@ export class HardcoverClient {
         }>(
           CREATE_READ_MUTATION,
           variables,
+          { keepalive },
         );
         this.debugLog('[Hardcover] CREATE result:', JSON.stringify(result, null, 2));
 

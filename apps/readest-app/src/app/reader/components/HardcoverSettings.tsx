@@ -4,8 +4,8 @@ import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useSettingsStore } from '@/store/settingsStore';
 import { eventDispatcher } from '@/utils/event';
-import { HardcoverClient } from '@/services/sync/HardcoverClient';
-import { HardcoverSyncStrategy } from '@/types/settings';
+import { HardcoverClient, getHardcoverCircuitState, resetHardcoverCircuitBreaker } from '@/services/sync/HardcoverClient';
+import { HardcoverSyncStrategy, HardcoverSyncFrequency } from '@/types/settings';
 import Dialog from '@/components/Dialog';
 
 type Option = {
@@ -66,14 +66,27 @@ export const HardcoverSettingsWindow: React.FC = () => {
   const [isOpen, setIsOpen] = useState(false);
   const [apiToken, setApiToken] = useState('');
   const [isConnecting, setIsConnecting] = useState(false);
+  const [circuitState, setCircuitState] = useState(getHardcoverCircuitState());
 
   const isConfigured = !!settings.hardcover?.apiToken;
+
+  // Poll circuit breaker state every second to update countdown
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const interval = setInterval(() => {
+      setCircuitState(getHardcoverCircuitState());
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [isOpen]);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
       setIsOpen(event.detail.visible);
       if (event.detail.visible) {
         setApiToken(settings.hardcover?.apiToken || '');
+        setCircuitState(getHardcoverCircuitState()); // Refresh circuit state
       }
     };
     const el = document.getElementById('hardcover_settings_window');
@@ -171,6 +184,47 @@ export const HardcoverSettingsWindow: React.FC = () => {
     await saveSettings(envConfig, newSettings);
   };
 
+  const handleSyncFrequencyChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const hardcover = {
+      ...settings.hardcover,
+      syncFrequency: e.target.value as HardcoverSyncFrequency,
+    };
+    const newSettings = { ...settings, hardcover };
+    setSettings(newSettings);
+    await saveSettings(envConfig, newSettings);
+  };
+
+  const handleResetCircuitBreaker = () => {
+    resetHardcoverCircuitBreaker();
+    setCircuitState(getHardcoverCircuitState());
+    eventDispatcher.dispatch('toast', {
+      message: _('Circuit breaker reset'),
+      type: 'success',
+    });
+  };
+
+  const getCircuitStateDisplay = () => {
+    switch (circuitState.state) {
+      case 'CLOSED':
+        return { text: _('Normal'), color: 'text-success' };
+      case 'OPEN':
+        const timeLeft = Math.max(
+          0,
+          Math.ceil((60000 - (Date.now() - circuitState.lastFailureTime)) / 1000),
+        );
+        return {
+          text: _('Open (retry in {{seconds}}s)', { seconds: timeLeft }),
+          color: 'text-error',
+        };
+      case 'HALF_OPEN':
+        return { text: _('Testing recovery'), color: 'text-warning' };
+      default:
+        return { text: _('Unknown'), color: 'text-base-content/60' };
+    }
+  };
+
+  const circuitDisplay = getCircuitStateDisplay();
+
   return (
     <Dialog
       id='hardcover_settings_window'
@@ -213,6 +267,21 @@ export const HardcoverSettingsWindow: React.FC = () => {
                 />
               </div>
 
+              <div className='form-control w-full'>
+                <label className='label py-1'>
+                  <span className='label-text font-medium'>{_('Sync Frequency')}</span>
+                </label>
+                <StyledSelect
+                  value={settings.hardcover.syncFrequency}
+                  onChange={handleSyncFrequencyChange}
+                  options={[
+                    { value: 'page', label: _('On page turn (every 5s)') },
+                    { value: 'chapter', label: _('On chapter change') },
+                    { value: 'session', label: _('On open/close only') },
+                  ]}
+                />
+              </div>
+
               <div className='flex h-14 items-center justify-between'>
                 <span className='text-base-content/80'>{_('Sync Reading Progress')}</span>
                 <input
@@ -241,6 +310,36 @@ export const HardcoverSettingsWindow: React.FC = () => {
                   checked={settings.hardcover.debug}
                   onChange={handleToggleDebug}
                 />
+              </div>
+
+              <div className='divider my-2'></div>
+
+              <div className='rounded-lg bg-base-200 p-3'>
+                <div className='mb-2 flex items-center justify-between'>
+                  <span className='text-sm font-medium'>{_('Circuit Breaker Status')}</span>
+                  {circuitState.state === 'OPEN' && (
+                    <button
+                      className='btn btn-xs btn-outline'
+                      onClick={handleResetCircuitBreaker}
+                    >
+                      {_('Reset')}
+                    </button>
+                  )}
+                </div>
+                <div className='flex items-center justify-between'>
+                  <span className='text-xs text-base-content/70'>{_('State:')}</span>
+                  <span className={clsx('text-xs font-semibold', circuitDisplay.color)}>
+                    {circuitDisplay.text}
+                  </span>
+                </div>
+                {circuitState.failureCount > 0 && circuitState.state !== 'OPEN' && (
+                  <div className='mt-1 flex items-center justify-between'>
+                    <span className='text-xs text-base-content/70'>{_('Failures:')}</span>
+                    <span className='text-xs text-warning'>
+                      {circuitState.failureCount}/3
+                    </span>
+                  </div>
+                )}
               </div>
 
               <p className='text-base-content/60 text-center text-xs'>

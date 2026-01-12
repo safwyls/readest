@@ -60,6 +60,7 @@ export const DEFAULT_HARDCOVER_SETTINGS = {
   strategy: 'prompt',
   syncProgress: true,
   syncStatus: true,
+  syncFrequency: 'page',
   autoMatchBooks: true,
   rateLimitBuffer: 50,
   debug: false,

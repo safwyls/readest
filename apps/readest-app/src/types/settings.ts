@@ -13,6 +13,7 @@ export type KOSyncChecksumMethod = 'binary' | 'filename';
 export type KOSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
 
 export type HardcoverSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
+export type HardcoverSyncFrequency = 'page' | 'chapter' | 'session';
 
 export interface ReadSettings {
   sideBarWidth: string;
@@ -47,6 +48,7 @@ export interface HardcoverSettings {
   strategy: HardcoverSyncStrategy;
   syncProgress: boolean;
   syncStatus: boolean;
+  syncFrequency: HardcoverSyncFrequency;
   autoMatchBooks: boolean;
   rateLimitBuffer: number;
   debug: boolean;

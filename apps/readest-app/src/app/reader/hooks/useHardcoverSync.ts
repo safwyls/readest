@@ -4,13 +4,37 @@ import { useSettingsStore } from '@/store/settingsStore';
 import { useReaderStore } from '@/store/readerStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useTranslation } from '@/hooks/useTranslation';
-import { HardcoverClient } from '@/services/sync/HardcoverClient';
+import { HardcoverClient, getHardcoverCircuitState, checkAndClearHardcoverRecovery, markHardcoverDisconnectNotified } from '@/services/sync/HardcoverClient';
 import { Book, FIXED_LAYOUT_FORMATS } from '@/types/book';
 import { HardcoverConflictData } from '@/services/sync/hardcoverTypes';
 import { debounce } from '@/utils/debounce';
 import { eventDispatcher } from '@/utils/event';
 
 type SyncState = 'idle' | 'checking' | 'conflict' | 'synced' | 'error' | 'matching';
+
+// Module-level registry for active sync promises
+const activeSyncPromises = new Map<string, Promise<void>>();
+
+// Module-level registry for forceSync functions
+const forceSyncFunctions = new Map<string, () => Promise<void>>();
+
+/**
+ * Get active sync promise for a bookKey
+ */
+export const getHardcoverActiveSyncPromise = (bookKey: string): Promise<void> | null => {
+  return activeSyncPromises.get(bookKey) || null;
+};
+
+/**
+ * Force sync for a specific bookKey (call directly before navigation)
+ */
+export const forceHardcoverSync = async (bookKey: string): Promise<void> => {
+  const forceSync = forceSyncFunctions.get(bookKey);
+  if (forceSync) {
+    console.log(`[Hardcover] Calling forceSync for bookKey: ${bookKey}`);
+    await forceSync();
+  }
+};
 
 export interface HardcoverSyncDetails {
   book: Book;
@@ -36,6 +60,8 @@ export const useHardcoverSync = (bookKey: string) => {
   const hasSetCurrentlyReading = useRef(false);
   const lastPercentage = useRef<number>(0);
   const isPulling = useRef(false);
+  const lastSyncedSection = useRef<string | null>(null);
+  const activeSyncPromise = useRef<Promise<void> | null>(null);
 
   const progress = getProgress(bookKey);
   const config = getConfig(bookKey);
@@ -106,7 +132,11 @@ export const useHardcoverSync = (bookKey: string) => {
       console.error('Hardcover book matching failed:', error);
       const errorMessage = (error as Error).message;
 
-      if (errorMessage.includes('AUTH_FAILED')) {
+      if (errorMessage.includes('HARDCOVER_CIRCUIT_OPEN')) {
+        console.warn('[Hardcover] Book matching blocked by circuit breaker');
+        setSyncState('error');
+        return null;
+      } else if (errorMessage.includes('AUTH_FAILED')) {
         eventDispatcher.dispatch('toast', {
           message: _('Hardcover authentication failed. Please check your API token.'),
           type: 'error',
@@ -460,6 +490,14 @@ export const useHardcoverSync = (bookKey: string) => {
       console.error('Hardcover pull progress failed:', error);
       const errorMessage = (error as Error).message;
 
+      // Handle circuit breaker being open
+      if (errorMessage.includes('HARDCOVER_CIRCUIT_OPEN')) {
+        console.warn('[Hardcover] Pull blocked by circuit breaker');
+        setSyncState('error');
+        isPulling.current = false;
+        return;
+      }
+
       // Silent fail for network errors to not disrupt reading
       if (!errorMessage.includes('NETWORK')) {
         eventDispatcher.dispatch('toast', {
@@ -486,40 +524,74 @@ export const useHardcoverSync = (bookKey: string) => {
   ]);
 
   /**
-   * Push progress to Hardcover
+   * Push progress to Hardcover (internal async function)
    */
-  const pushProgress = useMemo(
-    () =>
-      debounce(async () => {
-        debugLog('[Hardcover] pushProgress (debounced) executing');
+  const pushProgressInternal = useCallback(async () => {
+        // Check if circuit breaker is open - if so, silently skip (unless timeout has elapsed)
+        const circuitState = getHardcoverCircuitState();
+        if (circuitState.state === 'OPEN') {
+          const now = Date.now();
+          const timeElapsed = now - circuitState.lastFailureTime;
+          const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+
+          // If timeout hasn't elapsed yet, skip the sync
+          if (timeElapsed < CIRCUIT_BREAKER_TIMEOUT) {
+            debugLog('[Hardcover] Circuit breaker is open, silently skipping sync');
+            return;
+          }
+
+          // Timeout has elapsed - allow request to go through so circuit breaker can test recovery
+          debugLog('[Hardcover] Circuit breaker timeout elapsed, attempting recovery...');
+        }
+
+        const { settings } = useSettingsStore.getState();
+        const isSessionMode = settings.hardcover.syncFrequency === 'session';
+
+        if (isSessionMode) {
+          console.log('[Hardcover] pushProgress (debounced) executing in SESSION mode');
+        } else {
+          debugLog('[Hardcover] pushProgress (debounced) executing');
+        }
 
         if (!bookKey || !appService || !hardcoverClient) {
-          debugLog('[Hardcover] pushProgress early return - missing deps');
+          console.log('[Hardcover] pushProgress early return - missing deps:', {
+            bookKey: !!bookKey,
+            appService: !!appService,
+            hardcoverClient: !!hardcoverClient,
+          });
           return;
         }
 
         // Don't push if we're pulling or there's an unresolved conflict
         if (isPulling.current) {
-          debugLog('[Hardcover] pushProgress skipped - currently pulling from remote');
+          console.log('[Hardcover] pushProgress skipped - currently pulling from remote');
           return;
         }
 
         const currentConflictDetails = conflictDetails;
         if (syncState === 'conflict' || currentConflictDetails) {
-          debugLog('[Hardcover] pushProgress skipped - conflict pending resolution', {
+          console.log('[Hardcover] pushProgress skipped - conflict pending resolution', {
             syncState,
             hasConflictDetails: !!currentConflictDetails,
           });
           return;
         }
 
-        const { settings } = useSettingsStore.getState();
-        const { enabled, syncProgress, strategy } = settings.hardcover;
+        const { settings: currentSettings } = useSettingsStore.getState();
+        const { enabled, syncProgress, strategy } = currentSettings.hardcover;
 
-        debugLog('[Hardcover] pushProgress settings:', { enabled, syncProgress, strategy });
+        if (isSessionMode) {
+          console.log('[Hardcover] pushProgress settings (SESSION):', { enabled, syncProgress, strategy });
+        } else {
+          debugLog('[Hardcover] pushProgress settings:', { enabled, syncProgress, strategy });
+        }
 
         if (!enabled || !syncProgress || strategy === 'receive') {
-          debugLog('[Hardcover] pushProgress skipped - settings check failed');
+          console.log('[Hardcover] pushProgress skipped - settings check failed:', {
+            enabled,
+            syncProgress,
+            strategy,
+          });
           return;
         }
 
@@ -589,6 +661,7 @@ export const useHardcoverSync = (bookKey: string) => {
           readId: currentConfig?.hardcoverReadId,
           editionId: currentConfig?.hardcoverEditionId,
           startedAt: currentConfig?.hardcoverStartedAt,
+          keepalive: isSessionMode,
         });
 
         try {
@@ -599,6 +672,7 @@ export const useHardcoverSync = (bookKey: string) => {
             currentConfig?.hardcoverReadId,
             currentConfig?.hardcoverEditionId,
             currentConfig?.hardcoverStartedAt,
+            isSessionMode, // keepalive: true for session mode to survive page navigation
           );
 
           debugLog('[Hardcover] Progress update result:', result);
@@ -614,16 +688,47 @@ export const useHardcoverSync = (bookKey: string) => {
             });
             setSyncState('synced');
             debugLog('[Hardcover] Progress synced successfully, readId:', result.readId);
+
+            // Check if circuit breaker just recovered
+            const wasRecovered = checkAndClearHardcoverRecovery();
+            if (wasRecovered) {
+              eventDispatcher.dispatch('toast', {
+                message: _('Hardcover sync restored'),
+                type: 'success',
+              });
+            }
           } else {
             setSyncState('error');
             console.error('[Hardcover] Progress sync failed');
-            eventDispatcher.dispatch('toast', {
-              message: _('Failed to sync progress to Hardcover'),
-              type: 'error',
-            });
+
+            // Get circuit breaker state for notifications
+            const circuitState = getHardcoverCircuitState();
+
+            // Notification logic: 1st failure = notify, 2nd = silent, 3rd = notify circuit open
+            if (circuitState.failureCount === 1) {
+              eventDispatcher.dispatch('toast', {
+                message: _('Failed to sync progress to Hardcover'),
+                type: 'error',
+              });
+            } else if (circuitState.failureCount === 3 && circuitState.state === 'OPEN' && !circuitState.hasNotifiedDisconnect) {
+              eventDispatcher.dispatch('toast', {
+                message: _('Hardcover sync temporarily disabled. Will retry in 60 seconds.'),
+                type: 'error',
+              });
+              markHardcoverDisconnectNotified();
+            }
+            // failureCount === 2 or already notified: silent
           }
         } catch (error) {
           const errorMessage = (error as Error).message;
+
+          // Handle circuit breaker being open
+          if (errorMessage.includes('HARDCOVER_CIRCUIT_OPEN')) {
+            console.warn('[Hardcover] Circuit breaker is open, skipping sync');
+            setSyncState('error');
+            // Don't show toast for every blocked request - user already knows service is down
+            return;
+          }
 
           // If the stored hardcoverId is invalid (book doesn't exist in user's library), clear it
           if (errorMessage.includes('HARDCOVER_INVALID_USER_BOOK')) {
@@ -644,14 +749,34 @@ export const useHardcoverSync = (bookKey: string) => {
           } else {
             setSyncState('error');
             console.error('[Hardcover] Progress sync error:', error);
-            eventDispatcher.dispatch('toast', {
-              message: _('Failed to sync progress to Hardcover'),
-              type: 'error',
-            });
+
+            // Get circuit breaker state for notifications
+            const circuitState = getHardcoverCircuitState();
+
+            // Notification logic: 1st failure = notify, 2nd = silent, 3rd = notify circuit open
+            if (circuitState.failureCount === 1) {
+              eventDispatcher.dispatch('toast', {
+                message: _('Failed to sync progress to Hardcover'),
+                type: 'error',
+              });
+            } else if (circuitState.failureCount === 3 && circuitState.state === 'OPEN' && !circuitState.hasNotifiedDisconnect) {
+              eventDispatcher.dispatch('toast', {
+                message: _('Hardcover sync temporarily disabled. Will retry in 60 seconds.'),
+                type: 'error',
+              });
+              markHardcoverDisconnectNotified();
+            }
+            // failureCount === 2 or already notified: silent
           }
         }
-      }, 5000),
-    [bookKey, appService, hardcoverClient, matchBook, getProgress, getConfig, getBookData, setConfig, syncState, conflictDetails, _],
+  }, [bookKey, appService, hardcoverClient, matchBook, getProgress, getConfig, getBookData, setConfig, syncState, conflictDetails, _]);
+
+  /**
+   * Debounced wrapper for pushProgressInternal
+   */
+  const pushProgress = useMemo(
+    () => debounce(pushProgressInternal, 5000),
+    [pushProgressInternal],
   );
 
   // Event listeners for manual push/pull
@@ -663,16 +788,54 @@ export const useHardcoverSync = (bookKey: string) => {
     };
     const handleFlush = (event: CustomEvent) => {
       if (event.detail.bookKey !== bookKey) return;
-      pushProgress.flush();
+      console.log('[Hardcover] Flush event received, mode:', settings.hardcover.syncFrequency);
+
+      // For session mode, force an immediate sync on close
+      if (settings.hardcover.syncFrequency === 'session') {
+        console.log('[Hardcover] Session mode - forcing sync on book close');
+
+        // Create and store the sync promise
+        const syncPromise = (async () => {
+          try {
+            // Call the internal function directly (not debounced) and await it
+            await pushProgressInternal();
+            console.log('[Hardcover] Session mode sync completed successfully');
+
+            eventDispatcher.dispatch('toast', {
+              message: _('Synced to Hardcover'),
+              type: 'success',
+            });
+          } catch (error) {
+            console.error('[Hardcover] Session mode sync failed:', error);
+            eventDispatcher.dispatch('toast', {
+              message: _('Failed to sync to Hardcover'),
+              type: 'error',
+            });
+          } finally {
+            // Clear the promise ref and remove from registry
+            activeSyncPromise.current = null;
+            activeSyncPromises.delete(bookKey);
+          }
+        })();
+
+        activeSyncPromise.current = syncPromise;
+        // Register in module-level map so ReaderContent can wait for it
+        activeSyncPromises.set(bookKey, syncPromise);
+      } else {
+        // For other modes, just flush any pending calls
+        debugLog('[Hardcover] Flushing pending sync');
+        pushProgress.flush();
+      }
     };
     eventDispatcher.on('push-hardcover', handlePushProgress);
     eventDispatcher.on('flush-hardcover', handleFlush);
     return () => {
       eventDispatcher.off('push-hardcover', handlePushProgress);
       eventDispatcher.off('flush-hardcover', handleFlush);
+      // Always flush on unmount
       pushProgress.flush();
     };
-  }, [bookKey, pushProgress]);
+  }, [bookKey, pushProgress, settings.hardcover.syncFrequency, debugLog]);
 
   // Event listener for manual pull
   useEffect(() => {
@@ -700,6 +863,7 @@ export const useHardcoverSync = (bookKey: string) => {
       hasClient: !!hardcoverClient,
       enabled: settings.hardcover.enabled,
       syncProgress: settings.hardcover.syncProgress,
+      syncFrequency: settings.hardcover.syncFrequency,
       strategy: settings.hardcover.strategy,
       hardcoverId: config?.hardcoverId,
       syncState,
@@ -720,7 +884,28 @@ export const useHardcoverSync = (bookKey: string) => {
     }
 
     if (progress && hardcoverClient) {
-      const { strategy, enabled, syncProgress } = settings.hardcover;
+      const { strategy, enabled, syncProgress, syncFrequency } = settings.hardcover;
+
+      // Skip auto-push for 'session' mode (only sync on open/close)
+      if (syncFrequency === 'session') {
+        debugLog('[Hardcover] Auto-push skipped - session mode (sync on open/close only)');
+        return;
+      }
+
+      // For 'chapter' mode, only push when section changes
+      if (syncFrequency === 'chapter') {
+        const currentSection = progress.sectionHref;
+        if (currentSection === lastSyncedSection.current) {
+          debugLog('[Hardcover] Auto-push skipped - chapter mode and section unchanged');
+          return;
+        }
+        debugLog('[Hardcover] Chapter changed, syncing:', {
+          previous: lastSyncedSection.current,
+          current: currentSection,
+        });
+        lastSyncedSection.current = currentSection;
+      }
+
       if (strategy !== 'receive' && enabled && syncProgress) {
         debugLog('[Hardcover] Triggering pushProgress');
         pushProgress();
@@ -793,6 +978,88 @@ export const useHardcoverSync = (bookKey: string) => {
     }, 500);
   }, [conflictDetails, applyRemoteProgress]);
 
+  /**
+   * Force an immediate sync (for session mode on book close)
+   * This is called directly (not through events) to ensure proper awaiting
+   */
+  const forceSync = useCallback(async () => {
+    // Check if circuit breaker is open - if so, silently skip (unless timeout has elapsed)
+    const circuitState = getHardcoverCircuitState();
+    if (circuitState.state === 'OPEN') {
+      const now = Date.now();
+      const timeElapsed = now - circuitState.lastFailureTime;
+      const CIRCUIT_BREAKER_TIMEOUT = 60000; // 1 minute
+
+      // If timeout hasn't elapsed yet, skip the sync
+      if (timeElapsed < CIRCUIT_BREAKER_TIMEOUT) {
+        debugLog('[Hardcover] forceSync - circuit breaker is open, silently skipping');
+        return;
+      }
+
+      // Timeout has elapsed - allow request to go through so circuit breaker can test recovery
+      console.log('[Hardcover] forceSync - circuit breaker timeout elapsed, attempting recovery...');
+    }
+
+    const { syncFrequency } = useSettingsStore.getState().settings.hardcover;
+    if (syncFrequency !== 'session') {
+      // For non-session modes, just flush the debounced function
+      pushProgress.flush();
+      return;
+    }
+
+    // For session mode, do immediate sync
+    console.log('[Hardcover] forceSync called - executing immediate sync');
+    try {
+      await pushProgressInternal();
+      console.log('[Hardcover] forceSync completed successfully');
+
+      // Check if circuit breaker just recovered - only show toast for recovery
+      const wasRecovered = checkAndClearHardcoverRecovery();
+      if (wasRecovered) {
+        eventDispatcher.dispatch('toast', {
+          message: _('Hardcover sync restored'),
+          type: 'success',
+        });
+      }
+    } catch (error) {
+      const errorMessage = (error as Error).message;
+
+      // Handle circuit breaker being open silently (shouldn't happen due to check above)
+      if (errorMessage.includes('HARDCOVER_CIRCUIT_OPEN')) {
+        console.warn('[Hardcover] forceSync blocked by circuit breaker');
+        return;
+      }
+
+      console.error('[Hardcover] forceSync failed:', error);
+
+      // Get circuit breaker state for notifications
+      const circuitStateAfterError = getHardcoverCircuitState();
+
+      // Notification logic: 1st failure = notify, 2nd = silent, 3rd = notify circuit open
+      if (circuitStateAfterError.failureCount === 1) {
+        eventDispatcher.dispatch('toast', {
+          message: _('Failed to sync to Hardcover'),
+          type: 'error',
+        });
+      } else if (circuitStateAfterError.failureCount === 3 && circuitStateAfterError.state === 'OPEN' && !circuitStateAfterError.hasNotifiedDisconnect) {
+        eventDispatcher.dispatch('toast', {
+          message: _('Hardcover sync temporarily disabled. Will retry in 60 seconds.'),
+          type: 'error',
+        });
+        markHardcoverDisconnectNotified();
+      }
+      // failureCount === 2 or already notified: silent
+    }
+  }, [pushProgress, pushProgressInternal, _]);
+
+  // Register forceSync function in module registry
+  useEffect(() => {
+    forceSyncFunctions.set(bookKey, forceSync);
+    return () => {
+      forceSyncFunctions.delete(bookKey);
+    };
+  }, [bookKey, forceSync]);
+
   return {
     syncState,
     conflictDetails,
@@ -803,5 +1070,6 @@ export const useHardcoverSync = (bookKey: string) => {
     resolveWithLocal,
     resolveWithRemote,
     setNeedsMatching,
+    forceSync,
   };
 };

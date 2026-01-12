@@ -25,6 +25,7 @@ import { BookDetailModal } from '@/components/metadata';
 
 import useBooksManager from '../hooks/useBooksManager';
 import useBookShortcuts from '../hooks/useBookShortcuts';
+import { forceHardcoverSync } from '../hooks/useHardcoverSync';
 import Spinner from '@/components/Spinner';
 import SideBar from './sidebar/SideBar';
 import Notebook from './notebook/Notebook';
@@ -125,9 +126,15 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
     const { isPrimary } = getViewState(bookKey) || {};
     if (isPrimary && book && config) {
       const settings = useSettingsStore.getState().settings;
+
+      // Force Hardcover sync FIRST (before anything else, to prevent cancellation)
+      console.log('[ReaderContent] Force syncing Hardcover before save...');
+      await forceHardcoverSync(bookKey);
+      console.log('[ReaderContent] Hardcover sync completed');
+
       eventDispatcher.dispatch('sync-book-progress', { bookKey });
       eventDispatcher.dispatch('flush-kosync', { bookKey });
-      eventDispatcher.dispatch('flush-hardcover', { bookKey });
+
       await saveConfig(envConfig, bookKey, config, settings);
     }
   };
@@ -160,8 +167,8 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
     await saveSettings(envConfig, settings);
   }, 200);
 
-  const handleCloseBooksToLibrary = () => {
-    handleCloseBooks();
+  const handleCloseBooksToLibrary = async () => {
+    await handleCloseBooks();
     if (isTauriAppPlatform()) {
       const currentWindow = getCurrentWindow();
       if (currentWindow.label === 'main') {
@@ -175,7 +182,7 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
   };
 
   const handleCloseBook = async (bookKey: string) => {
-    saveConfigAndCloseBook(bookKey);
+    await saveConfigAndCloseBook(bookKey);
     if (sideBarBookKey === bookKey) {
       setSideBarBookKey(getNextBookKey(sideBarBookKey));
     }
